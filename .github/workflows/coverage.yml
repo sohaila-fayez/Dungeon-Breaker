@@ -2,7 +2,9 @@ name: Code Coverage (JaCoCo)
 
 on:
   pull_request:
-  workflow_dispatch:
+  push:
+    branches:
+      - master
 
 jobs:
   coverage:
