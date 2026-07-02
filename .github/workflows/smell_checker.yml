@@ -23,10 +23,11 @@ jobs:
         run: |
           mkdir -p tools
           curl -L -o tools/DesigniteJava.jar \
-            "https://github.com/tushartushar/DesigniteJava/releases/download/v2.0.0/DesigniteJava.jar"
+            "https://github.com/tushartushar/DesigniteJava/releases/latest/download/DesigniteJava.jar"
+          ls -lh tools/
 
       - name: Build project first
-        run: ./gradlew assemble -x :blockly:npmInstall
+        run: ./gradlew assemble -x :blockly:npmInstall -x :blockly:jar
 
       - name: Run Designite on dungeon
         run: |

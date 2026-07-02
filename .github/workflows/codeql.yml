@@ -24,14 +24,14 @@ jobs:
           distribution: 'temurin'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v2
         with:
-          languages: java-kotlin
+          languages: java
 
       - name: Build with Gradle
-        run: ./gradlew assemble -x :blockly:npmInstall
+        run: ./gradlew assemble -x :blockly:npmInstall -x :blockly:jar
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v2
         with:
-          category: /language:java-kotlin
+          category: /language:java
