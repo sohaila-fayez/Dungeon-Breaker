@@ -58,6 +58,24 @@ def parse_args():
         help="Line coverage at or above this value is shown as good.",
     )
 
+    parser.add_argument(
+        "--branch-name",
+        default=os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME"),
+        help="Branch name shown in the coverage summary."
+    )
+
+    parser.add_argument(
+        "--base-branch",
+        default=os.environ.get("GITHUB_BASE_REF"),
+        help="BASE branch for pull request."
+    )
+
+    parser.add_argument(
+        "--commit-sha",
+        default=os.environ.get("GITHUB_SHA"),
+        help="Commit SHA shown in the coverage summary."
+    )
+
     return parser.parse_args()
 
 
@@ -162,6 +180,23 @@ def metric_label(metric):
     return labels.get(metric, metric.title())
 
 
+
+def build_branch_section(branch_name, base_branch, commit_sha):
+    lines = []
+    
+    lines.append("> [!IMPORTANT]")
+    lines.append(f"> **Ergebnisse für Branch:** `{branch_name or 'unbekannt'}`")
+
+    if base_branch:
+        lines.append(f"> **Ziel-Branch:** `{base_branch}`")
+    
+    if commit_sha:
+        lines.append(f"> **Commit:** `{commit_sha[:7]}`")
+
+    lines.append("")
+    return lines
+
+
 def build_total_table(totals):
     lines = []
 
@@ -243,7 +278,16 @@ def build_report_paths_section(report_files):
     return lines
 
 
-def build_summary(report_files, totals, module_results, warning_threshold, good_threshold):
+def build_summary(
+        report_files, 
+        totals, 
+        module_results, 
+        warning_threshold,
+        good_threshold,
+        branch_name=None,
+        base_branch=None,
+        commit_sha=None
+        ):
     line_coverage = None
 
     if "LINE" in totals:
@@ -262,6 +306,15 @@ def build_summary(report_files, totals, module_results, warning_threshold, good_
 
     lines.append("# JaCoCo Code Coverage")
     lines.append("")
+
+    lines.extend(
+        build_branch_section(
+            branch_name=branch_name,
+            base_branch=base_branch,
+            commit_sha=commit_sha
+        )
+    )
+
     lines.append(f"**Status:** {status}")
     lines.append("")
     lines.append(f"**Line Coverage:** `{format_percentage(line_coverage)}`")
@@ -333,6 +386,9 @@ def main():
         module_results=module_results,
         warning_threshold=args.warning_line_coverage,
         good_threshold=args.good_line_coverage,
+        branch_name=args.branch_name,
+        base_branch=args.base_branch,
+        commit_sha=args.commit_sha,
     )
 
     if args.summary_file:
