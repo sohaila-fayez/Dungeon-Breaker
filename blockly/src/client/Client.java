@@ -1,6 +1,5 @@
 package client;
 
-import client.hud.StageConfig;
 import coderunner.BlocklyCodeRunner;
 import coderunner.BlocklyCommands;
 import com.sun.net.httpserver.HttpServer;
@@ -166,9 +165,14 @@ public class Client {
       if (httpServer != null) {
         httpServer.stop(0);
       }
-      BlocklyCodeRunner.instance().stopCode();
-      FrontendServer.stopServer();
-      FolderExtractor.deleteCompilerResources();
+
+      try {
+        FrontendServer.stopServer();
+        BlocklyCodeRunner.instance().stopCode();
+        FolderExtractor.deleteCompilerResources();
+      } catch (Exception e) {
+        java.lang.System.out.println("Error stopping server");
+      }
     }
   }
 
@@ -210,7 +214,9 @@ public class Client {
           PortalRegistry.registerPelletCatcherBehavior(
               () -> new BlocklyEnergyPelletCatcherBehavior());
 
-          StageConfig.setupStage();
+          // Disbaled beacuse of bugs: see
+          // https://github.com/Dungeon-CampusMinden/Dungeon/issues/3070
+          // StageConfig.setupStage();
           startServer();
         });
   }

@@ -3,6 +3,7 @@ package core.game;
 import static com.badlogic.gdx.graphics.GL20.GL_COLOR_BUFFER_BIT;
 
 import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.Screen;
 import com.badlogic.gdx.ScreenAdapter;
 import com.badlogic.gdx.assets.AssetManager;
 import com.badlogic.gdx.backends.headless.HeadlessFiles;
@@ -28,21 +29,30 @@ import core.components.DrawComponent;
 import core.components.PlayerComponent;
 import core.components.PositionComponent;
 import core.components.SoundComponent;
+import core.language.Translation;
 import core.level.loader.DungeonLoader;
 import core.level.loader.LevelParser;
 import core.network.ConnectionListener;
 import core.network.MessageDispatcher;
+import core.network.NetworkTelemetry;
 import core.network.client.ClientNetwork;
 import core.network.delta.SnapshotDeltaCompressor;
+import core.network.messages.c2s.InitialWorldReady;
 import core.network.messages.c2s.InputMessage;
-import core.network.messages.c2s.SnapshotAck;
+import core.network.messages.s2c.DebugPong;
+import core.network.messages.s2c.DebugTelemetrySnapshot;
 import core.network.messages.s2c.DeltaSnapshotMessage;
 import core.network.messages.s2c.DialogCloseMessage;
 import core.network.messages.s2c.DialogShowMessage;
+import core.network.messages.s2c.EntityDelta;
 import core.network.messages.s2c.EntityDespawnEvent;
+import core.network.messages.s2c.EntitySpawnBatch;
 import core.network.messages.s2c.EntitySpawnEvent;
+import core.network.messages.s2c.EntityState;
 import core.network.messages.s2c.GameOverEvent;
+import core.network.messages.s2c.InitialWorldComplete;
 import core.network.messages.s2c.LevelChangeEvent;
+import core.network.messages.s2c.LevelState;
 import core.network.messages.s2c.SnapshotMessage;
 import core.network.messages.s2c.SoundPlayMessage;
 import core.network.messages.s2c.SoundStopMessage;
@@ -74,6 +84,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * The Dungeon-GameLoop.
@@ -88,12 +99,20 @@ import java.util.Set;
  */
 public final class GameLoop extends ScreenAdapter {
   private static final DungeonLogger LOGGER = DungeonLogger.getLogger(GameLoop.class);
+  private static final String T_DISCONNECTED_FROM_SERVER = "disconnected_from_server";
+  private static final String T_DISCONNECTED_FROM_SERVER_REASON = "disconnected_from_server_reason";
+  private static final Translation trans = new Translation("game_loop");
   private static ISoundPlayer soundPlayer = new NoSoundPlayer();
   private static Stage stage;
   private boolean doSetup = true;
   private int displayModeTransitionFrames = 0;
+  private volatile boolean initialWorldCompleteReceived = false;
+  private volatile boolean initialWorldReadySent = false;
+  private volatile boolean initialWorldClientReady = false;
   private static final Set<IResizable> resizables = new HashSet<>();
   private static String windowTitle = "Dungeon";
+  private static Supplier<? extends Screen> initialScreenSupplier;
+  private static com.badlogic.gdx.Game application;
 
   /**
    * Sets {@link Game#currentLevel} to the new level and changes the currently active entity
@@ -113,12 +132,15 @@ public final class GameLoop extends ScreenAdapter {
           Game.currentLevel()
               .ifPresent(level -> CheckPatternPainter.paintCheckerPattern(level.layout()));
 
-        if (!PreRunConfiguration.isNetworkServer()) return; // no authority
+        boolean serverAuthority = PreRunConfiguration.isNetworkServer();
+        if (serverAuthority) {
+          SoundTracker.instance().clear();
+        }
 
-        SoundTracker.instance().clear();
-
-        List<Entity> allPlayers = ECSManagement.allPlayers().toList();
-        allPlayers.forEach(ECSManagement::remove);
+        List<Entity> allPlayers = serverAuthority ? ECSManagement.allPlayers().toList() : List.of();
+        if (serverAuthority) {
+          allPlayers.forEach(ECSManagement::remove);
+        }
         // Remove the systems so that each triggerOnRemove(entity) will be called (basically
         // cleanup).
         Map<Class<? extends System>, System> s = ECSManagement.systems();
@@ -129,17 +151,18 @@ public final class GameLoop extends ScreenAdapter {
         // readd the systems so that each triggerOnAdd(entity) will be called (basically
         // setup). This will also create new EntitySystemMapper if needed.
         s.values().forEach(ECSManagement::add);
+        ECSManagement.allEntities()
+            .filter(Entity::isPersistent)
+            .map(ECSManagement::remove)
+            .forEach(ECSManagement::add);
+
+        if (!serverAuthority) return; // no authority
 
         try {
           allPlayers.forEach(GameLoop::placeOnLevelStart);
         } catch (MissingComponentException e) {
           LOGGER.warn(e.getMessage());
         }
-        ECSManagement.allEntities()
-            .filter(Entity::isPersistent)
-            .map(ECSManagement::remove)
-            .forEach(ECSManagement::add);
-
         Game.currentLevel()
             .ifPresent(
                 level ->
@@ -178,17 +201,49 @@ public final class GameLoop extends ScreenAdapter {
     }
 
     if (!PreRunConfiguration.multiplayerEnabled() || Game.isMultiplayerClient()) {
-      new Lwjgl3Application(
+      application =
           new com.badlogic.gdx.Game() {
             @Override
             public void create() {
-              setScreen(new GameLoop());
+              setScreen(
+                  initialScreenSupplier != null ? initialScreenSupplier.get() : new GameLoop());
             }
-          },
-          config);
+          };
+      new Lwjgl3Application(application, config);
     } else {
       // Server mode does not create a window.
       new GameLoop().setup();
+    }
+  }
+
+  /**
+   * Sets the supplier for the initial {@link Screen} shown when the application starts.
+   *
+   * <p>By default the application starts directly in the {@link GameLoop}. Setting a supplier (for
+   * example a {@link MainMenuScreen}) shows that screen first; use {@link #startGame()} to
+   * transition to the actual game later. Has no effect in headless server mode.
+   *
+   * <p>The supplier is invoked after the libGDX application (and therefore the GL context) has been
+   * created.
+   *
+   * @param supplier factory for the initial screen, or {@code null} to start in the game loop
+   */
+  public static void initialScreen(final Supplier<? extends Screen> supplier) {
+    initialScreenSupplier = supplier;
+  }
+
+  /**
+   * Switches the active screen to a fresh {@link GameLoop}, starting the core game.
+   *
+   * <p>Intended to be called from the initial screen (e.g. the {@link MainMenuScreen}) to leave the
+   * menu and enter the game. The game-specific setup configured via {@link
+   * PreRunConfiguration#userOnSetup(IVoidFunction)} runs on the first frame of the new game loop.
+   */
+  public static void startGame() {
+    if (application != null) {
+      application.setScreen(new GameLoop());
+    } else {
+      LOGGER.warn("Cannot start the game screen: no active libGDX application.");
     }
   }
 
@@ -253,11 +308,17 @@ public final class GameLoop extends ScreenAdapter {
         DrawSystem.class,
         drawSystem -> DrawSystem.batch().setProjectionMatrix(CameraSystem.camera().combined));
     // Drain any inbound network messages on the game thread before running systems
+    NetworkTelemetry.recordFrameDelta(delta);
+    long networkDispatchStartNanos = java.lang.System.nanoTime();
     try {
       Game.network().pollAndDispatch();
     } catch (Exception e) {
       LOGGER.warn("Error while polling network messages: {}", e.getMessage(), e);
+    } finally {
+      NetworkTelemetry.recordNetworkDispatchBatch(
+          java.lang.System.nanoTime() - networkDispatchStartNanos);
     }
+    tryCompleteInitialWorldHandshake();
     frame(delta);
     clearScreen();
 
@@ -310,11 +371,18 @@ public final class GameLoop extends ScreenAdapter {
           .addConnectionListener(
               new ConnectionListener() {
                 @Override
-                public void onConnected() {}
+                public void onConnected() {
+                  resetInitialWorldHandshake();
+                }
 
                 @Override
                 public void onDisconnected(String reason) {
+                  boolean wasInGameplay = initialWorldClientReady;
+                  resetInitialWorldHandshake();
                   InputMessage.resetSequence();
+                  if (Game.isMultiplayerClient() && wasInGameplay) {
+                    Game.exit(multiplayerDisconnectReason(reason));
+                  }
                 }
               });
     }
@@ -430,13 +498,22 @@ public final class GameLoop extends ScreenAdapter {
               }
             }
 
-            Game.add(
+            Entity hero =
                 HeroBuilder.builder()
                     .id(event.entityId())
                     .characterClass(CharacterClass.fromByteId(event.characterClassId()))
                     .isLocalPlayer(isLocal)
                     .username(pc.playerName())
-                    .build());
+                    .build();
+            if (event.positionComponent() != null) {
+              hero.fetch(PositionComponent.class)
+                  .ifPresent(
+                      position -> {
+                        position.position(event.positionComponent().position());
+                        position.viewDirection(event.positionComponent().viewDirection());
+                      });
+            }
+            Game.add(hero);
             trackNetworkEntity(ctx, event.entityId());
             return;
           }
@@ -451,6 +528,17 @@ public final class GameLoop extends ScreenAdapter {
           newEntity.persistent(event.isPersistent());
           Game.add(newEntity);
           trackNetworkEntity(ctx, event.entityId());
+        });
+
+    dispatcher.registerHandler(
+        EntitySpawnBatch.class,
+        (ctx, batch) -> batch.entities().forEach(event -> dispatcher.dispatch(ctx, event)));
+
+    dispatcher.registerHandler(
+        InitialWorldComplete.class,
+        (ctx, event) -> {
+          initialWorldCompleteReceived = true;
+          tryCompleteInitialWorldHandshake();
         });
 
     dispatcher.registerHandler(
@@ -498,24 +586,67 @@ public final class GameLoop extends ScreenAdapter {
           Game.exit(event.reason());
         });
     dispatcher.registerHandler(
+        DebugTelemetrySnapshot.class,
+        (ctx, event) -> {
+          NetworkTelemetry.recordServerSnapshot(event);
+        });
+    dispatcher.registerHandler(
+        DebugPong.class,
+        (ctx, event) -> {
+          NetworkTelemetry.recordDebugPong(event);
+        });
+    dispatcher.registerHandler(
         SnapshotMessage.class,
         (ctx, event) -> {
+          long staleCheckNanos = 0L;
+          long fullApplyNanos = 0L;
+          long reconcileNanos = 0L;
+          long ackNanos = 0L;
           try {
+            long applyStartNanos = java.lang.System.nanoTime();
             Optional<ClientState> clientState = clientState(ctx);
             if (clientState.isPresent()) {
               ClientState state = clientState.orElseThrow();
+              long staleCheckStartNanos = java.lang.System.nanoTime();
               if (event.serverTick() <= state.latestAppliedSnapshotTick()) {
+                staleCheckNanos = java.lang.System.nanoTime() - staleCheckStartNanos;
+                NetworkTelemetry.recordHandlerStaleSnapshot(false, event.serverTick());
+                NetworkTelemetry.recordSnapshotHandlerTiming(
+                    false, event.serverTick(), staleCheckNanos, 0L, 0L, 0L, 0L, true);
                 LOGGER.debug("Skipped stale full snapshot at tick {}.", event.serverTick());
                 return;
               }
+              staleCheckNanos = java.lang.System.nanoTime() - staleCheckStartNanos;
             }
+            long fullApplyStartNanos = java.lang.System.nanoTime();
             Game.network().snapshotTranslator().applySnapshot(event, dispatcher);
-            clientState.ifPresent(
-                state -> {
-                  state.rememberAppliedSnapshot(event);
-                  reconcileNetworkEntities(state, event);
-                  sendSnapshotAck(event.serverTick());
-                });
+            fullApplyNanos = java.lang.System.nanoTime() - fullApplyStartNanos;
+            if (clientState.isPresent()) {
+              ClientState state = clientState.orElseThrow();
+              long reconcileStartNanos = java.lang.System.nanoTime();
+              state.rememberAppliedSnapshot(event);
+              reconcileNetworkEntities(state, event);
+              long reconcileEndNanos = java.lang.System.nanoTime();
+              long ackStartNanos = java.lang.System.nanoTime();
+              Game.network().acknowledgeSnapshot(event.serverTick(), true);
+              reconcileNanos = reconcileEndNanos - reconcileStartNanos;
+              ackNanos = java.lang.System.nanoTime() - ackStartNanos;
+            }
+            NetworkTelemetry.recordSnapshotApplied(
+                false,
+                event.serverTick(),
+                event.entities().size(),
+                0,
+                java.lang.System.nanoTime() - applyStartNanos);
+            NetworkTelemetry.recordSnapshotHandlerTiming(
+                false,
+                event.serverTick(),
+                staleCheckNanos,
+                fullApplyNanos,
+                0L,
+                reconcileNanos,
+                ackNanos,
+                false);
           } catch (Exception e) {
             LOGGER.warn("Error while applying snapshot message: {}", e.getMessage(), e);
           }
@@ -523,28 +654,50 @@ public final class GameLoop extends ScreenAdapter {
     dispatcher.registerHandler(
         DeltaSnapshotMessage.class,
         (ctx, event) -> {
+          long staleCheckNanos = 0L;
+          long deltaMaterializeNanos = 0L;
+          long fullApplyNanos = 0L;
+          long reconcileNanos = 0L;
+          long ackNanos = 0L;
           try {
+            long applyStartNanos = java.lang.System.nanoTime();
             Optional<ClientState> clientState = clientState(ctx);
             if (clientState.isEmpty()) {
               LOGGER.debug("Ignoring delta snapshot without client state.");
               return;
             }
             ClientState state = clientState.orElseThrow();
+            long staleCheckStartNanos = java.lang.System.nanoTime();
             if (event.serverTick() <= state.latestAppliedSnapshotTick()) {
+              staleCheckNanos = java.lang.System.nanoTime() - staleCheckStartNanos;
+              NetworkTelemetry.recordHandlerStaleSnapshot(true, event.serverTick());
+              NetworkTelemetry.recordSnapshotHandlerTiming(
+                  true, event.serverTick(), staleCheckNanos, 0L, 0L, 0L, 0L, true);
               LOGGER.debug("Ignoring stale delta snapshot at tick {}.", event.serverTick());
               return;
             }
 
             Optional<SnapshotMessage> baseline = state.appliedSnapshot(event.baseTick());
             if (baseline.isEmpty()) {
+              staleCheckNanos = java.lang.System.nanoTime() - staleCheckStartNanos;
+              NetworkTelemetry.recordMissingLocalDeltaBaseline(
+                  event.baseTick(), event.serverTick());
+              Game.network().requestSnapshotResync(event.baseTick(), event.serverTick());
+              NetworkTelemetry.recordSnapshotHandlerTiming(
+                  true, event.serverTick(), staleCheckNanos, 0L, 0L, 0L, 0L, true);
               LOGGER.debug(
                   "Ignoring delta snapshot for base tick {}; no matching local baseline.",
                   event.baseTick());
               return;
             }
+            staleCheckNanos = java.lang.System.nanoTime() - staleCheckStartNanos;
 
+            long materializeStartNanos = java.lang.System.nanoTime();
             SnapshotMessage materializedSnapshot =
                 SnapshotDeltaCompressor.materializeSnapshot(baseline.orElseThrow(), event);
+            SnapshotMessage changedSnapshot = changedSnapshotForDelta(event, materializedSnapshot);
+            deltaMaterializeNanos = java.lang.System.nanoTime() - materializeStartNanos;
+            long removalReconcileStartNanos = java.lang.System.nanoTime();
             event
                 .removedEntityIds()
                 .forEach(
@@ -552,10 +705,32 @@ public final class GameLoop extends ScreenAdapter {
                       Game.findEntityById(entityId).ifPresent(Game::remove);
                       state.untrackNetworkEntity(entityId);
                     });
-            Game.network().snapshotTranslator().applySnapshot(materializedSnapshot, dispatcher);
-            state.rememberAppliedSnapshot(materializedSnapshot);
+            reconcileNanos += java.lang.System.nanoTime() - removalReconcileStartNanos;
+            long fullApplyStartNanos = java.lang.System.nanoTime();
+            Game.network().snapshotTranslator().applySnapshot(changedSnapshot, dispatcher);
+            fullApplyNanos = java.lang.System.nanoTime() - fullApplyStartNanos;
+            long reconcileStartNanos = java.lang.System.nanoTime();
+            state.rememberAppliedSnapshot(materializedSnapshot, List.of(event.baseTick()));
             reconcileNetworkEntities(state, materializedSnapshot);
-            sendSnapshotAck(event.serverTick());
+            reconcileNanos += java.lang.System.nanoTime() - reconcileStartNanos;
+            long ackStartNanos = java.lang.System.nanoTime();
+            Game.network().acknowledgeSnapshot(event.serverTick());
+            ackNanos = java.lang.System.nanoTime() - ackStartNanos;
+            NetworkTelemetry.recordSnapshotApplied(
+                true,
+                event.serverTick(),
+                changedSnapshot.entities().size(),
+                event.removedEntityIds().size(),
+                java.lang.System.nanoTime() - applyStartNanos);
+            NetworkTelemetry.recordSnapshotHandlerTiming(
+                true,
+                event.serverTick(),
+                staleCheckNanos,
+                fullApplyNanos,
+                deltaMaterializeNanos,
+                reconcileNanos,
+                ackNanos,
+                false);
           } catch (Exception e) {
             LOGGER.warn("Error while applying delta snapshot message: {}", e.getMessage(), e);
           }
@@ -626,6 +801,44 @@ public final class GameLoop extends ScreenAdapter {
         });
   }
 
+  private void resetInitialWorldHandshake() {
+    initialWorldCompleteReceived = false;
+    initialWorldReadySent = false;
+    initialWorldClientReady = false;
+  }
+
+  private String multiplayerDisconnectReason(String reason) {
+    if (reason == null || reason.isBlank()) {
+      return trans.text(T_DISCONNECTED_FROM_SERVER);
+    }
+    return trans.text(T_DISCONNECTED_FROM_SERVER_REASON, reason);
+  }
+
+  private void tryCompleteInitialWorldHandshake() {
+    if (!Game.isMultiplayerClient()
+        || initialWorldClientReady
+        || !initialWorldCompleteReceived
+        || Game.player().isEmpty()) {
+      return;
+    }
+
+    if (initialWorldReadySent) {
+      return;
+    }
+    initialWorldReadySent = true;
+    Game.network()
+        .send((short) 0, new InitialWorldReady(), true)
+        .whenComplete(
+            (success, error) -> {
+              if (error == null && Boolean.TRUE.equals(success)) {
+                initialWorldClientReady = true;
+                Game.network().markInitialWorldReady();
+                return;
+              }
+              initialWorldReadySent = false;
+            });
+  }
+
   /**
    * Called at the beginning of each frame, before the entities are updated and the systems are
    * executed.
@@ -644,8 +857,18 @@ public final class GameLoop extends ScreenAdapter {
     PreRunConfiguration.userOnFrame().execute();
   }
 
-  private static void sendSnapshotAck(int serverTick) {
-    Game.network().send((short) 0, new SnapshotAck(serverTick), true);
+  static SnapshotMessage changedSnapshotForDelta(
+      DeltaSnapshotMessage delta, SnapshotMessage materializedSnapshot) {
+    Set<Integer> changedEntityIds = new HashSet<>();
+    delta.entityDeltas().stream().map(EntityDelta::entityId).forEach(changedEntityIds::add);
+
+    List<EntityState> changedEntities =
+        materializedSnapshot.entities().stream()
+            .filter(entityState -> changedEntityIds.contains(entityState.entityId()))
+            .toList();
+    LevelState changedLevelState =
+        delta.levelStateDeltaOptional().orElseGet(() -> new LevelState(Set.of()));
+    return new SnapshotMessage(delta.serverTick(), changedEntities, changedLevelState);
   }
 
   private void fullscreenKey() {
@@ -675,7 +898,6 @@ public final class GameLoop extends ScreenAdapter {
    * @param entity entity to set on the start of the level, normally this is the player.
    */
   private static void placeOnLevelStart(final Entity entity) {
-    ECSManagement.add(entity);
     entity
         .fetch(PositionComponent.class)
         .ifPresent(
@@ -685,6 +907,7 @@ public final class GameLoop extends ScreenAdapter {
                       pc::position, () -> LOGGER.warn("No start tile found for the current level"));
               pc.viewDirection(Direction.DOWN); // look down by default
             });
+    ECSManagement.add(entity);
 
     // reset animations
     entity.fetch(DrawComponent.class).ifPresent(DrawComponent::resetState);

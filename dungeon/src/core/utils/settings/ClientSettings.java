@@ -1,27 +1,35 @@
 package core.utils.settings;
 
+import core.language.Language;
+import core.language.Localization;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.Objects;
 import java.util.function.BiConsumer;
 
 /** Manages client-side settings for the game, such as volume levels and control bindings. */
 public class ClientSettings {
 
   /** Key for master volume setting. */
-  public static final String MASTER_VOLUME = "masterVolume";
+  public static final String KEY_MASTER_VOLUME = "settings.master_volume";
 
   /** Key for effects volume setting. */
-  public static final String EFFECTS_VOLUME = "effectsVolume";
+  public static final String KEY_EFFECTS_VOLUME = "settings.effects_volume";
 
   /** Key for music volume setting. */
-  public static final String MUSIC_VOLUME = "musicVolume";
+  public static final String KEY_MUSIC_VOLUME = "settings.music_volume";
+
+  /** Key for language setting. */
+  public static final String KEY_LANGUAGE = "settings.language";
 
   private static ClientSettings instance = null;
   private final HashMap<String, SettingValue<?>> settings;
+  private final HashMap<String, Boolean> onlyIngame;
   private BiConsumer<String, Integer> onVolumeChange = (key, value) -> {};
 
   private ClientSettings() {
     settings = new LinkedHashMap<>();
+    onlyIngame = new HashMap<>();
   }
 
   /**
@@ -50,17 +58,23 @@ public class ClientSettings {
   }
 
   private void init() {
-    IntSliderSetting masterVolume = new IntSliderSetting("Master Volume", 70, 0, 100, 5);
-    IntSliderSetting effectsVolume = new IntSliderSetting("Effects Volume", 70, 0, 100, 5);
-    IntSliderSetting musicVolume = new IntSliderSetting("Music Volume", 5, 0, 100, 5);
+    Localization localization = Localization.getInstance();
+    IntSliderSetting masterVolume = new IntSliderSetting(KEY_MASTER_VOLUME, 70, 0, 100, 5);
+    IntSliderSetting effectsVolume = new IntSliderSetting(KEY_EFFECTS_VOLUME, 70, 0, 100, 5);
+    IntSliderSetting musicVolume = new IntSliderSetting(KEY_MUSIC_VOLUME, 5, 0, 100, 5);
 
-    masterVolume.onChange((v) -> onVolumeChange.accept(MASTER_VOLUME, v));
-    effectsVolume.onChange((v) -> onVolumeChange.accept(EFFECTS_VOLUME, v));
-    musicVolume.onChange((v) -> onVolumeChange.accept(MUSIC_VOLUME, v));
+    masterVolume.onChange((v) -> onVolumeChange.accept(KEY_MASTER_VOLUME, v));
+    effectsVolume.onChange((v) -> onVolumeChange.accept(KEY_EFFECTS_VOLUME, v));
+    musicVolume.onChange((v) -> onVolumeChange.accept(KEY_MUSIC_VOLUME, v));
 
-    registerSetting(MASTER_VOLUME, masterVolume);
-    registerSetting(EFFECTS_VOLUME, effectsVolume);
-    registerSetting(MUSIC_VOLUME, musicVolume);
+    registerSetting(masterVolume);
+    registerSetting(effectsVolume);
+    registerSetting(musicVolume);
+
+    EnumSetting<Language> language =
+        new EnumSetting<>(KEY_LANGUAGE, localization.currentLanguage());
+    language.onChange(localization::currentLanguage);
+    registerSetting(language);
   }
 
   /**
@@ -69,7 +83,7 @@ public class ClientSettings {
    * @return the current master volume level as an integer
    */
   public static int masterVolume() {
-    return (int) getSetting(MASTER_VOLUME).value();
+    return (int) getSetting(KEY_MASTER_VOLUME).value();
   }
 
   /**
@@ -78,7 +92,7 @@ public class ClientSettings {
    * @return the current effects volume level as an integer
    */
   public static int effectsVolume() {
-    return (int) getSetting(EFFECTS_VOLUME).value();
+    return (int) getSetting(KEY_EFFECTS_VOLUME).value();
   }
 
   /**
@@ -87,18 +101,43 @@ public class ClientSettings {
    * @return the current music volume level as an integer
    */
   public static int musicVolume() {
-    return (int) getSetting(MUSIC_VOLUME).value();
+    return (int) getSetting(KEY_MUSIC_VOLUME).value();
   }
 
   /**
-   * Registers a new setting with the given key. If a setting with the same key already exists, it
-   * will be overwritten.
+   * Registers a new setting. The setting's translation key is used as unique key. If a setting with
+   * the same key already exists, it will be overwritten.
    *
-   * @param key the unique identifier for the setting
    * @param setting the SettingValue object representing the setting to be registered
    */
-  public static void registerSetting(String key, SettingValue<?> setting) {
-    getInstance().settings.put(key, setting);
+  public static void registerSetting(SettingValue<?> setting) {
+    Objects.requireNonNull(setting, "setting");
+    getInstance().settings.put(setting.translationKey(), setting);
+  }
+
+  /**
+   * Marks whether a setting should only be shown while in-game and hidden in the main menu.
+   *
+   * <p>By default every setting is visible in both the main menu and the in-game settings. Calling
+   * this with {@code ingame == true} restricts the setting to the in-game settings only.
+   *
+   * @param key the translation key identifying the setting
+   * @param ingame {@code true} if the setting should only be shown in-game (hidden in the main
+   *     menu); {@code false} to show it in both places
+   */
+  public static void setOnlyIngame(String key, boolean ingame) {
+    Objects.requireNonNull(key, "key");
+    getInstance().onlyIngame.put(key, ingame);
+  }
+
+  /**
+   * Returns whether the setting with the given key is restricted to the in-game settings.
+   *
+   * @param key the translation key identifying the setting
+   * @return {@code true} if the setting should only be shown in-game
+   */
+  public static boolean isOnlyIngame(String key) {
+    return getInstance().onlyIngame.getOrDefault(key, false);
   }
 
   /**
@@ -144,6 +183,30 @@ public class ClientSettings {
   }
 
   /**
+   * Returns the settings that should be shown for the given context, preserving insertion order.
+   *
+   * <p>When {@code ingame} is {@code false} (main menu), settings marked via {@link
+   * #setOnlyIngame(String, boolean)} are omitted. When {@code ingame} is {@code true}, all settings
+   * are returned.
+   *
+   * @param ingame {@code true} if the settings are built for the in-game menu, {@code false} for
+   *     the main menu
+   * @return an ordered map of the settings visible in the requested context
+   */
+  public static LinkedHashMap<String, SettingValue<?>> getSettings(boolean ingame) {
+    LinkedHashMap<String, SettingValue<?>> visible = new LinkedHashMap<>();
+    getInstance()
+        .settings
+        .forEach(
+            (key, setting) -> {
+              if (ingame || !isOnlyIngame(key)) {
+                visible.put(key, setting);
+              }
+            });
+    return visible;
+  }
+
+  /**
    * Serializes the settings to a JSON file for persistent storage.
    *
    * <p>TODO: Implement this
@@ -159,14 +222,5 @@ public class ClientSettings {
    */
   public static void load() {
     // load from json
-  }
-
-  private static String formatEnumTitle(Enum<?> e) {
-    String[] parts = e.name().toLowerCase().split("_");
-    StringBuilder out = new StringBuilder();
-    for (String p : parts) {
-      out.append(Character.toUpperCase(p.charAt(0))).append(p.substring(1)).append(' ');
-    }
-    return out.toString().trim();
   }
 }

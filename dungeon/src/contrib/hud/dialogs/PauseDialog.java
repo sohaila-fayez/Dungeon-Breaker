@@ -14,12 +14,17 @@ import com.badlogic.gdx.scenes.scene2d.utils.ChangeListener;
 import com.badlogic.gdx.utils.Align;
 import contrib.components.UIComponent;
 import contrib.hud.UIUtils;
+import contrib.hud.elements.RichLabel;
 import core.Entity;
 import core.Game;
+import core.game.HostSession;
+import core.game.PreRunConfiguration;
+import core.language.Translation;
 import core.sound.CoreSounds;
 import core.sound.Sounds;
 import core.utils.BaseContainerUI;
 import core.utils.FontSpec;
+import core.utils.NetworkUtils;
 import core.utils.Scene2dElementFactory;
 import core.utils.settings.ClientSettings;
 import java.util.ArrayList;
@@ -31,6 +36,18 @@ import java.util.List;
  * <p>Creates a simple pause dialog.
  */
 public class PauseDialog extends Table {
+
+  private static final String T_PAUSED = "paused";
+  private static final String T_RESUME = "resume";
+  private static final String T_SETTINGS = "settings";
+  private static final String T_QUIT_TO_DESKTOP = "quit_to_desktop";
+  private static final String T_BACK = "back";
+  private static final String T_YOU = "you";
+  private static final String T_SERVER_STATUS = "server_status";
+  private static final String T_SERVER_RUNNING = "server_running";
+  private static final String T_SERVER_STOPPED = "server_stopped";
+  private static final String T_PLAYERS_CAN_CONNECT_VIA = "players_can_connect_via";
+  private static final Translation trans = new Translation("dialog.pause_dialog");
 
   private Skin skin;
   private DialogContext ctx;
@@ -126,12 +143,12 @@ public class PauseDialog extends Table {
   private Table createMainView(DialogContext ctx) {
     Label label =
         Scene2dElementFactory.createLabel(
-            "PAUSED", FontSpec.of("fonts/Roboto-Bold.ttf", 48, Color.BLACK));
-    TextButton resumeBtn = Scene2dElementFactory.createButton("Resume", "clean-green", 32);
+            trans.text(T_PAUSED), FontSpec.of("fonts/Roboto-Bold.ttf", 48, Color.BLACK));
+    TextButton resumeBtn = Scene2dElementFactory.createButton(trans.text(T_RESUME), "green", 32);
     TextButton settingsBtn =
-        Scene2dElementFactory.createButton("Settings", "clean-blue-outline", 32);
+        Scene2dElementFactory.createButton(trans.text(T_SETTINGS), "blue-outline", 32);
     TextButton quitBtn =
-        Scene2dElementFactory.createButton("Quit to Desktop", "clean-red-outline", 32);
+        Scene2dElementFactory.createButton(trans.text(T_QUIT_TO_DESKTOP), "red-outline", 32);
 
     resumeBtn.addListener(
         new ChangeListener() {
@@ -163,14 +180,54 @@ public class PauseDialog extends Table {
     menu.add(resumeBtn).width(300).align(Align.center).padBottom(10).row();
     menu.add(settingsBtn).width(300).align(Align.center).padBottom(70).row();
     menu.add(quitBtn).width(300).align(Align.center).padBottom(15).row();
+
+    if (PreRunConfiguration.multiplayerEnabled()) {
+      menu.add(Scene2dElementFactory.createHorizontalDivider()).width(300).padBottom(8).row();
+      menu.add(createServerStatusSection()).width(300).align(Align.left).padBottom(5).row();
+    }
+
     return menu;
+  }
+
+  /**
+   * Builds the server-status section shown at the bottom of the pause menu: the local player name
+   * and the connection address, plus, when this client is hosting, the live server status and the
+   * addresses other players can use to connect.
+   *
+   * @return the populated server-status section
+   */
+  private Table createServerStatusSection() {
+    Table section = new Table();
+
+    String player = PreRunConfiguration.username();
+    int port = PreRunConfiguration.networkPort();
+
+    section.add(statusLabel(trans.text(T_YOU, player))).left().row();
+
+    if (HostSession.isHosting()) {
+      String serverStatus =
+          HostSession.isServerRunning()
+              ? trans.text(T_SERVER_RUNNING)
+              : trans.text(T_SERVER_STOPPED);
+      section.add(statusLabel(trans.text(T_SERVER_STATUS, serverStatus))).left().padTop(0).row();
+      section.add(statusLabel(trans.text(T_PLAYERS_CAN_CONNECT_VIA, port))).left().padTop(0).row();
+      for (String ip : NetworkUtils.localIpAddresses()) {
+        section.add(statusLabel(ip)).left().row();
+      }
+    }
+
+    return section;
+  }
+
+  private RichLabel statusLabel(String text) {
+    return new RichLabel("[color=#555555][size=18]" + text);
   }
 
   private Table createSettingsView(DialogContext ctx) {
     Label label =
         Scene2dElementFactory.createLabel(
-            "SETTINGS", FontSpec.of("fonts/Roboto-Bold.ttf", 48, Color.BLACK));
-    TextButton backBtn = Scene2dElementFactory.createButton("Back", "clean-green", 32);
+            trans.text(T_SETTINGS), FontSpec.of("fonts/Roboto-Bold.ttf", 48, Color.BLACK));
+    TextButton backBtn = Scene2dElementFactory.createButton(trans.text(T_BACK), "green", 32);
     backBtn.addListener(
         new ChangeListener() {
           @Override
@@ -181,7 +238,7 @@ public class PauseDialog extends Table {
         });
     List<Actor> settingsActors = new ArrayList<>();
 
-    ClientSettings.getSettings()
+    ClientSettings.getSettings(true)
         .forEach(
             (s, setting) -> {
               settingsActors.add(setting.toUIActor());
